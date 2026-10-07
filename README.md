@@ -1,457 +1,214 @@
-# Migrating a Production Secrets Platform to OpenBao
+# OpenBao secrets platform: implementation guide
 
-## Document status
+## About this guide
 
-* **Audience:** platform engineering, SRE, security, and application teams
-* **Scope:** implementation experience from a multi-cluster Kubernetes platform
-* **Purpose:** explain why OpenBao was selected, how it was deployed, what was tested, what was learned, and what is required for production operation
-* **Sensitivity:** organization names, internal URLs, account identifiers, repository names, and personal names have been removed
+It describes one real implementation, with company and service names generalized. The three diagrams are included as image files beside this document. One screenshot has been lightly edited to replace service-specific labels.
 
-## Executive summary
+## 1. The problem this solves
 
-The organization selected OpenBao after architecture discussions and proof-of-concept work. The first delivery phase was not a simple binary replacement: it replaced encrypted-file secret handling used by deployment automation with a Kubernetes-native secret-management platform. The design also preserved a Vault-compatible operating model so that existing concepts—authentication methods, policies, secret engines, leases, TTLs, and audit logging—could be retained.
+Applications need passwords, API tokens, certificates, and other secrets. A secret manager is a service that stores these values, decides who can read or create them, and can expire or revoke them.
 
-The implementation uses one OpenBao deployment per Kubernetes cluster rather than one shared global cluster. Applications declare the properties of their secrets through a custom Secret Definition resource. OpenBao generates or retrieves the value and renders a normal Kubernetes Secret in the application namespace. Existing applications therefore continue consuming Kubernetes Secrets without application-code changes, while engineers no longer need to know the secret values.
+**HashiCorp Vault** is a secret manager. **OpenBao** is an open-source, community-driven fork of Vault. It uses a similar API and the same basic ideas: authentication, access policies, secret engines, short-lived tokens, leases, and audit logs.
 
-The project included:
+Before the change described here, more than 230 secrets used by Kubernetes workloads were kept in encrypted files in source control. The files were encrypted, but access to the decryption key could expose many secrets at once, including production values. Auditing and rotation were also harder to manage consistently.
 
-* a security and compliance review;
-* a real-application pilot;
-* OpenBao deployment and hardening work;
-* testing of static and generated secrets;
-* detailed testing of token TTL and dynamic-secret leases;
-* dynamic security testing of OpenBao 2.5.1; and
-* production-readiness work for audit logging, backup, monitoring, and upgrades.
+The goal was to move secret creation and access into a central service. Application teams should be able to describe the secret they need without seeing the secret value themselves.
 
-## 1. Why the change was needed
+### Important scope detail
 
-### 1.1 Encrypted files were not enough
+The internal project did **not** document a direct migration of data from an existing Vault cluster into OpenBao. The first phase focused on replacing SOPS-encrypted files used by deployment automation. OpenBao was selected after discussions and proof-of-concept work, in part because it keeps a familiar Vault-style API and operating model.
 
-At the time of the assessment, more than 230 secrets were used by Kubernetes-deployed services to connect to other services, cloud providers, and data stores. Many were stored in encrypted files committed to source control.
+## 2. How the solution works
 
-Encryption protected the files at rest, but the model had important limitations:
+At a high level:
 
-* access to the decryption key could expose many secrets at once;
-* production and non-production access were not sufficiently separated;
-* the file-based workflow did not provide enterprise-level authorization;
-* access auditing was limited or absent;
-* some secrets existed outside the encrypted-file workflow; and
-* secret generation, rotation, and revocation were not consistently managed.
+1. A workload or operator proves its identity to OpenBao.
+2. OpenBao checks a policy to decide what that identity is allowed to do.
+3. OpenBao reads, creates, or fetches the requested secret.
+4. A Kubernetes controller can place the result in a normal Kubernetes Secret.
+5. The application reads that Kubernetes Secret as it did before.
+6. For dynamic credentials, OpenBao tracks a timer (a **lease**) and can revoke the credential when the lease expires.
 
-The key problem was therefore not only where the ciphertext was stored. It was how access to the plaintext was granted, audited, rotated, and revoked.
+A **static secret** stays the same until someone changes it. A **dynamic secret** is created when requested and usually has a limited lifetime. A **policy** is a set of allow/deny rules. A **TTL** is the time before a token or secret expires.
 
-### 1.2 Why OpenBao was selected
+Some Kubernetes resources and APIs still use the word “Vault.” That is often because OpenBao is Vault-compatible or because an existing controller keeps its original name; it does not mean two secret managers must be running.
 
-After discussions and proof-of-concept work, OpenBao was selected because it provided a community-driven, open-source implementation based on the Vault model while supporting the capabilities required by the platform:
+## 3. The three diagrams
 
-* secret engines;
-* authentication methods;
-* fine-grained policies;
-* renewable tokens and leases;
-* dynamic secrets;
-* Kubernetes integration;
-* audit devices; and
-* high availability with integrated storage.
+### 3.1 API token: issue, use, and revoke
 
-The choice was also practical. The platform could retain familiar Vault concepts and client patterns while moving to an independently governed open-source project.
+![OpenBao API token lifecycle, with service-specific labels generalized](openbao-api-token-lifecycle-flow.png)
 
-### 1.3 Scope was intentionally phased
+*This flow shows a protected service issuing a scoped API token through an OpenBao secrets engine. The Kubernetes operator writes the token to a Kubernetes Secret for the application. OpenBao tracks its lease and asks the protected service to revoke the token when it expires or is revoked.*
 
-The initial phase focused on Kubernetes workloads and deployment automation. Future phases were expected to extend the model to additional secret producers and consumers, including CI workflows, other automation systems, external integrations, and controlled human access.
+In this implementation, platform owners configured the protected service, while application owners defined the roles and secret resources they needed. The configuration operator applied those settings to OpenBao. Because the operator did not have generic resources for every custom plugin, the proof of concept reused compatible configuration resources from an existing plugin. That was a workaround, not the ideal long-term interface.
 
-This phased approach avoided attempting to migrate every secret and every access pattern at the same time.
+### 3.2 Updating a Kubernetes Secret safely
 
-## 2. Decisions made by the implementation team
+![Kubernetes secret update flow for Vault-compatible resources](openbao-kubernetes-secret-update-flow.png)
 
-The following decisions were specific to the implementation rather than generic migration advice.
+*The diagram shows a new secret version being created, rendered into a Kubernetes Secret, and then used by the application. A reloader can restart the application when the Secret changes; the old version can be removed after the new one works.*
 
-| Area | Decision | Reason |
+Two practical limits are called out in the diagram: the secret-sync process does not guarantee that every application restarts, and teams may need to manage more than one Kubernetes resource type. A reloader or an application-specific reload mechanism is still needed when the app only reads a secret at startup.
+
+### 3.3 Dynamic database credentials with External Secrets Operator
+
+![OpenBao dynamic database secret flow through External Secrets Operator](openbao-external-secrets-dynamic-database-flow.png)
+
+*OpenBao stores the database connection and role settings. A Kubernetes service account authenticates to OpenBao, which creates short-lived database credentials. External Secrets Operator then writes the username and password into a Kubernetes Secret for the workload.*
+
+The diagram also records an implementation constraint: the dynamic-secret resource needed a dedicated OpenBao role that allowed the user in the same Kubernetes namespace as the resource.
+
+## 4. Main design choices
+
+| Choice | What it means | Why it was used |
 |---|---|---|
-| Deployment topology | Deploy a separate OpenBao cluster in each Kubernetes cluster | Reduce blast radius and simplify isolation |
-| Secret interface | Use a custom Secret Definition resource | Store secret requirements in repositories, not secret values |
-| Application compatibility | Render standard Kubernetes Secrets | Keep existing applications unchanged |
-| High availability | Use integrated storage with Raft and active/standby nodes | Provide quorum-based durability and failover |
-| Unsealing | Use cloud KMS auto-unseal | Avoid manually reconstructingunseal material during normal restarts |
-| Human access | Use an identity-aware access gateway and group-to-policy mapping | Avoid exposing OpenBao directly and enforce least privilege |
-| Workload access | Use Kubernetes/OIDC-based authentication | Bind access to workload identity rather than shared credentials |
-| Image integrity | Pin images and verify the external KMS plugin checksum | Prevent a mismatched or modified seal plugin from starting |
-| Scheduling | Use a dedicated worker pool | Reduce co-tenancy and side-channel exposure |
-| Backup | Use integrated-storage snapshots sent to object storage | Provide a recoverable copy outside the cluster |
-| Audit | Start with reliable local log collection and design for a second audit destination | Preserve availability while improving forensic retention |
-| Upgrade strategy | Roll standby nodes before the active leader | Avoid failover to an older version |
+| One OpenBao cluster per Kubernetes cluster | Each cluster has its own secret-manager deployment | Limits the impact of a cluster problem and makes isolation easier |
+| Raft integrated storage | OpenBao nodes keep replicated storage using Raft | Provides high availability without a separate storage service |
+| Five-node reference cluster | The documented reference deployment used five replicas | Supports a Raft quorum and standby nodes; size should still be validated for each environment |
+| Cloud KMS auto-unseal | A cloud key-management service helps OpenBao unlock after restart | Avoids manual unsealing during normal operations |
+| Kubernetes identity | Workloads authenticate using their Kubernetes service account | Avoids distributing shared passwords to applications |
+| Secret Definition resources | Teams describe the secret they need instead of writing the value into a repository | Keeps the value out of normal code review and deployment files |
+| Standard Kubernetes Secrets for apps | Controllers write the result into the usual Kubernetes Secret object | Most applications do not need code changes |
+| Restricted human access | People authenticate through an identity-aware access path and receive policy-scoped access | Limits who can read or change secrets |
+| Snapshots to object storage | OpenBao snapshots are stored outside the cluster | Supports recovery if the cluster or storage is lost |
 
-## 3. Target architecture
+### A KMS detail that matters during deployment
 
-### 3.1 Components
+The cloud KMS seal plugin is included in the OpenBao image. OpenBao checks the plugin's SHA-256 checksum when it starts. The checksum must match the plugin in the image. If the image tag changes but the checksum does not, OpenBao can stay sealed and fail to start normally.
 
-The deployed platform consists of:
+### Bootstrap and root tokens
 
-* **OpenBao server:** API, authentication, policy evaluation, secret engines, token store, lease management, and audit brokering.
-* **Integrated storage:** local durable storage with Raft consensus, quorum writes, active/standby behavior, and snapshot/restore.
-* **Configuration operator:** applies declarative authentication, policy, secret-engine, and secret-synchronization resources.
-* **Secret Definition interface:** custom Kubernetes resources that describe how a secret should be generated or retrieved.
-* **KMS seal plugin:** allows OpenBao to auto-unseal using a cloud KMS.
-* **Certificate management:** issues and distributes the internal CA and API certificates.
-* **Access gateway sidecar:** exchanges an identity-provider JWT for an OpenBao token and forwards requests to the active node.
-* **Snapshot agent:** periodically exports integrated-storage snapshots to an object-storage bucket.
-* **Monitoring and log collection:** captures health, audit events, failures, latency, seal state, and storage status.
+The initialization job creates the cluster, stores recovery material, enables Kubernetes authentication, and sets up the first operator permissions. Root and recovery material are break-glass credentials: keep access tightly restricted and do not put them in application repositories or ordinary CI/CD variables.
 
-### 3.2 Secret Definition workflow
+Some bootstrap policies are created only during initialization. Editing the bootstrap script does not automatically update policies in clusters that already exist; those clusters need an explicit, authenticated policy update.
 
-Teams define secret requirements instead of storing plaintext values. A definition can specify properties such as:
+## 5. Deployment steps used in practice
 
-* secret name and destination;
-* length and complexity;
-* rotation period;
-* static versus generated behavior; and
-* the owning workload or service.
+### Step 1: Prepare the Kubernetes environment
 
-During deployment:
+Before installing OpenBao, prepare:
 
-1. the configuration operator authenticates to OpenBao;
-2. OpenBao generates a new value or retrieves an existing value;
-3. the value is stored in OpenBao or fetched from the configured engine;
-4. the operator renders a standard Kubernetes Secret; and
-5. the application consumes the Kubernetes Secret using its existing configuration.
-
-The intended result is that engineers can review the definition and policy without seeing the resulting secret.
-
-## 4. Deployment procedure used in practice
-
-### 4.1 Provision dependencies first
-
-The deployment required the following resources before installing the OpenBao chart:
-
-* certificate management and trust-distribution components;
 * dedicated worker capacity;
 * persistent storage;
-* cloud KMS resources and IAM permissions;
-* an object-storage bucket for snapshots;
-* image-pull credentials; and
-* monitoring and log-collection paths.
+* TLS certificates and a way to distribute the trusted CA;
+* cloud KMS permissions;
+* an object-storage location for snapshots;
+* image-pull credentials in the required namespaces; and
+* monitoring and log collection.
 
-The deployment tool in use could not reliably create all namespaces during installation. The implementation therefore created the OpenBao, configuration-operator, and certificate-reloader namespaces in advance, with the Helm ownership labels and annotations required for subsequent releases.
+Namespaces were created before the Helm releases because the deployment system could not create them reliably. Helm ownership labels and annotations were added so the releases could manage those namespaces correctly.
 
-Image-pull credentials were created in the required namespaces and replicated where appropriate.
+The nodes were checked for synchronized time and disabled swap. Swap matters because secret data is handled in memory and must not be written to disk in clear text.
 
-### 4.2 Configure KMS auto-unseal
+### Step 2: Deploy OpenBao
 
-Each node starts sealed. It can find its storage, but it cannot use the stored data until the barrier encryption key is unwrapped.
+Deploy the OpenBao chart with TLS, Raft storage, KMS auto-unseal, and the required scheduling rules. Use DNS names that match the TLS certificates; relying on pod IP addresses can cause certificate validation failures.
 
-The implementation used a cloud KMS seal. The KMS infrastructure supplied:
+The reference configuration used a dedicated worker pool and five OpenBao replicas. Confirm the actual replica count, capacity, storage, and quorum requirements for the target environment instead of copying values blindly.
 
-* the KMS key or alias;
-* the service-account IAM role;
-* the region or provider configuration; and
-* the permissions required by the OpenBao pods.
+### Step 3: Initialize and check the cluster
 
-A significant operational detail was introduced by newer OpenBao versions: cloud KMS seals are delivered as external plugins. The plugin binary was included in the custom OpenBao image, and its SHA-256 checksum was supplied to the chart.
+Run the initialization process once. Verify that:
 
-The image tag and checksum must be changed together. If the image contains a different plugin than the configured checksum, OpenBao refuses to configure the seal and the cluster remains sealed.
+* the first node initializes successfully;
+* KMS auto-unseal works after a pod restart;
+* the other nodes join the Raft cluster;
+* one node becomes active and the rest are standby; and
+* recovery material is stored only in a restricted location.
 
-### 4.3 Prepare nodes and storage
+### Step 4: Deploy the configuration operator
 
-OpenBao was scheduled onto a dedicated worker pool with matching tolerations and node selectors. The nodes were checked for:
+Deploy the Kubernetes configuration operator after OpenBao and its CA are available. The operator applies OpenBao policies, authentication roles, secret engines, and secret-sync resources.
 
-* disabled swap;
-* synchronized clocks;
-* restricted network access;
-* restricted persistent-volume access; and
-* appropriate operating-system and container security settings.
+### Step 5: Apply OpenBao configuration
 
-Swap was explicitly checked because sensitive data must remain in memory and must not be paged to disk in cleartext.
+Apply the policies, Kubernetes authentication, secret-engine configuration, database roles, audit configuration, and snapshot permissions. Give the operator only the permissions it needs.
 
-### 4.4 Deploy in dependency order
+The snapshot agent was deployed before its permissions and credentials existed. Its first job could therefore report a configuration error until the OpenBao configuration step finished; later runs succeeded. The runbook should make that dependency clear so an expected first-run error is not mistaken for a persistent backup failure.
 
-The deployment order was:
+### Step 6: Move workloads in stages
 
-1. **OpenBao chart** — server, storage, TLS, auto-unseal, sidecars, and snapshot agent.
-2. **Configuration operator** — controller that depends on the CA bundle produced by the OpenBao deployment.
-3. **OpenBao configuration** — declarative policies, authentication methods, secret engines, audit configuration, and snapshot-agent permissions.
+Start with a pilot workload. Confirm that it can read the secret, that unauthorized workloads are denied, and that application restart or reload works when the secret changes. Then move additional workloads in planned groups.
 
-The order matters. The snapshot agent is deployed with the OpenBao chart, but its Kubernetes authentication role, policy, and object-storage credential are created by the later configuration step. Consequently, the first snapshot job may temporarily enter `CreateContainerConfigError` until the configuration deployment completes. Subsequent runs succeed without manual intervention.
+Remove an old secret source only after its consumers have moved and the new flow has been verified.
 
-### 4.5 Initialize the cluster
+## 6. Tests and findings
 
-The chart included an initialization job that:
+### Application pilot
 
-* initialized the cluster after the first node became available;
-* persisted the root token and recovery keys in a Kubernetes Secret;
-* enabled Kubernetes authentication; and
-* created the minimum policies and roles required by the configuration operator.
+The pilot used real application scenarios, not only API calls. It covered a static secret and a generated secret consumed by an application. The goal was to confirm that the controller could write a Kubernetes Secret and that the application could keep using the familiar Kubernetes interface. The pilot task was recorded as completed.
 
-Bootstrap policies were intentionally limited. They were not treated as ordinary continuously reconciled resources because doing so would require long-lived root-level credentials. When bootstrap policies change, the implementation requires:
+### Token and lease tests
 
-1. updating the initialization script and image;
-2. deploying the change to new environments; and
-3. applying the corresponding policy update to existing environments through an authenticated administrative procedure.
+The team tested how the configuration operator's token lifetime interacts with the lifetime of a generated secret. The important finding was that when the token that created a dynamic secret expires, the secret's lease may be revoked too—even if the secret's own TTL looks longer.
 
-Root tokens and recovery material are break-glass credentials only. They must not be placed in repositories, CI/CD variables, or long-lived workload Secrets.
+Two approaches were tested:
 
-### 4.6 Configure high availability
+* request a new token with enough lifetime for the longest secret; or
+* cache and renew the operator token while making sure active secret leases are not left dependent on a token that is about to expire.
 
-The reference design used integrated storage with Raft. One node is active and the remaining nodes are hot standbys. If the active node fails, a standby can promote itself.
+The selected approach cached and renewed the operator token with a sufficiently long TTL. This reduces unexpected revocation, but it also means a token can remain active for a long time if the operator never restarts. The TTL and renewal policy must balance reliability with access risk.
 
-The reference cluster used five replicas. A new node joined by discovering the current leader, completing a seal-based challenge, receiving the cluster certificate, applying a Raft snapshot, contacting the KMS, and auto-unsealing.
+### Security testing
 
-The implementation also required DNS-based API and cluster addresses. Using pod IP addresses would not match the certificate subject-alternative names and could break TLS validation between clients and nodes.
+Dynamic security testing was performed against OpenBao 2.5.1. It checked authentication, policy boundaries, privilege escalation, URL handling, and sensitive-data exposure.
 
-### 4.7 Configure human access
+The assessment did not confirm an exploitable critical issue under the tested supported configuration. It did identify controls that still matter:
 
-Human access was routed through an identity-aware gateway. The gateway sidecar:
+* keep the raw-storage endpoint disabled;
+* restrict permissions that can change identity groups or policies;
+* limit outbound network access for configured URLs; and
+* use unique TOTP secrets where TOTP is used.
 
-1. received a JWT from the access gateway;
-2. exchanged the JWT for an OpenBao token using JWT authentication;
-3. selected a role based on identity-provider group membership;
-4. cached the token for its lease; and
-5. forwarded requests to the active OpenBao node.
+A clean assessment does not mean every deployment is safe. The surrounding Kubernetes, network, identity, and policy configuration still matters.
 
-The gateway was not treated as the authorization boundary. Each OpenBao role also had to bind the allowed groups through JWT claims. Otherwise, a caller with a valid JWT could attempt to request a more privileged role directly.
+### Audit and backup readiness
 
-### 4.8 Configure snapshots
+OpenBao can stop serving requests if it cannot write to an enabled audit device. The implementation favored a reliable stdout log path first and considered a second file-based audit destination for additional retention. A network audit device was treated carefully because a blocked network write could block requests.
 
-Integrated storage was backed up through snapshots written to object storage. The process required:
+A snapshot job is not proof that recovery works. Restore snapshots in an isolated cluster and confirm that policies, authentication, secrets, and application access recover correctly. The operational guidance calls for restore testing at least twice per year.
 
-* a bucket created before deployment;
-* restricted bucket access;
-* an IAM identity for the snapshot agent;
-* storage of the snapshot-agent credential in OpenBao; and
-* a Kubernetes authentication role and policy for the snapshot agent.
+## 7. Results and production expectations
 
-The backup is not considered complete until a restore has been tested in an isolated environment.
+The documented work showed that:
 
-## 5. Security hardening applied
+* real workloads could consume static and generated secrets through Kubernetes;
+* applications could keep using standard Kubernetes Secrets;
+* the token/lease test found a production risk before broad rollout and informed the TTL decision;
+* security testing found no exploitable critical issue in the tested default configuration;
+* the design included per-cluster isolation, Raft, KMS auto-unseal, TLS, and controlled access; and
+* audit, backup, upgrade, and recovery work remained part of operating the platform.
 
-The production hardening checklist included the following controls:
+OpenBao is not a “set it and forget it” package. The owning SRE/platform team needs to:
 
-* run OpenBao as a non-root user;
-* use a read-only root filesystem where possible;
-* allow writes only to the persistent data volume and required temporary directories;
-* use TLS for client, server, and cluster communication;
-* prefer TLS 1.3;
-* disable swap;
-* disable core dumps because they can expose encryption keys;
-* use a dedicated worker pool;
-* apply Kubernetes network policies;
-* restrict persistent-volume and cloud-volume access;
-* keep clocks synchronized;
-* disable command history in sensitive container contexts;
-* disable `sys/raw` in normal operation;
-* avoid root tokens outside bootstrap and break-glass recovery;
-* use least-privilege policies for the configuration operator;
-* audit API requests; and
-* define offboarding procedures for access revocation and credential rotation.
+* review security advisories and apply updates through vulnerability management;
+* plan regular upgrades and verify image digests and plugin checksums;
+* monitor audit delivery, authentication failures, latency, seal status, Raft health, storage, and certificate expiry;
+* keep access policies and owners up to date;
+* test snapshot restoration at least twice a year; and
+* keep runbooks for upgrades, recovery, and emergency access current.
 
-The hardening review also recorded that OpenBao is not itself FIPS-certified, although a deployment may be configured with FIPS-oriented components or images where required.
+Upgrades were not considered zero-downtime. The documented approach takes a snapshot, upgrades standby nodes before the active node, and uses a controlled rollout. A storage-format change may require restoring a snapshot rather than simply deploying the previous image.
 
-## 6. Testing performed
-
-### 6.1 Real-application pilot
-
-The pilot was designed around real application scenarios rather than only synthetic API checks. It included:
-
-* deploying the secret manager in a representative environment;
-* consuming a static secret from a real application;
-* consuming both static and generated secrets from a real application; and
-* verifying that applications continued to use ordinary Kubernetes Secrets.
-
-The pilot was tracked as a completed engineering initiative, with no test-type gap recorded.
-
-### 6.2 Token and lease lifecycle investigation
-
-A production-readiness investigation found an important interaction between configuration-operator tokens and dynamic-secret leases:
-
-* a dynamic secret receives a lease associated with the token that created it;
-* when the parent token expires, dependent leases may be revoked even if their own TTL is longer; and
-* a secret created close to the parent token's maximum TTL can therefore expire earlier than expected.
-
-Two alternatives were tested in a proof-of-concept environment:
-
-1. create a new token for each request with a TTL exceeding the longest secret TTL plus a safety buffer; or
-2. cache and renew the operator token, while ensuring it stops using the token early enough that no active secret lease depends on it when the token finally expires.
-
-Both test scenarios confirmed the expected behavior. The selected approach was token caching with a sufficiently large TTL. The design constraint was recorded explicitly: if renewal occurs at roughly 73% of the token lifetime, the remaining lifetime must still exceed the longest dynamic-secret TTL. In simplified form:
-
-```text
-remaining token lifetime after the final renewal > longest dynamic-secret TTL
-```
-
-The trade-off was also documented: caching reduces unwanted lease revocation but can keep one token alive for months if the operator is not restarted. That token lifetime must therefore be balanced against security requirements and operational restart behavior.
-
-### 6.3 Dynamic security testing
-
-The security assessment used dynamic testing across reconnaissance, authentication, privilege escalation, policy evaluation, SSRF/lateral movement, persistence, and data-exposure scenarios. The assessment targeted OpenBao 2.5.1.
-
-The main results were:
-
-| Test area | Result |
-|---|---|
-| Seal status and OIDC discovery endpoints | Information was limited and considered intended for health or standards-compliant OIDC behavior |
-| Token decoding and malformed JWT handling | Invalid input failed safely; no sensitive information was disclosed |
-| Mixed-case user names and password changes | The old password failed; no phantom user or authentication bypass was observed |
-| Case-sensitive policy paths | Reads and writes to both case variants were denied; no policy bypass was observed |
-| Identity-group privilege escalation | Not exploitable by a non-root token in the tested version; identity-group write access remains highly privileged |
-| `sys/raw` privilege escalation | Requires explicitly insecure configuration and authorization; endpoint kept disabled |
-| Certificate and JWKS URL requests | Arbitrary URLs are part of the supported configuration model; outbound restrictions should be enforced at the network layer |
-| PKI `sign-verbatim` testing | Incorrect PoC parameters returned HTTP 400; the endpoint is intentionally privileged and unsafe |
-| TOTP cross-key reuse | Deterministic TOTP behavior was expected; unique secrets per account or key are required |
-
-The overall conclusion was that no exploitable critical finding was confirmed under the default supported configuration. Several test cases still produced important operational requirements: restrict identity-management permissions, keep `sys/raw` disabled, limit outbound network access, and use unique TOTP secrets.
-
-### 6.4 Audit logging tests and design
-
-The security review required audit logging and recommended at least two audit devices because OpenBao refuses to service requests if it cannot write to an enabled audit device.
-
-The implementation discussion made a pragmatic first choice:
-
-* use standard log collection from stdout as the reliable primary path;
-* avoid a directly connected network audit device that could block OpenBao operations during a socket problem;
-* consider a second file- or object-storage-backed audit device for forensic retention; and
-* add checks and dashboard panels for audit failures and latency.
-
-The pilot audit rollout was temporarily blocked by an implementation bug that had recently been fixed. This was tracked as a readiness issue rather than treated as evidence that audit logging could be omitted.
-
-### 6.5 Deployment and Kubernetes tests
-
-Deployment testing covered details that are easy to miss in a generic migration:
-
-* namespace ownership labels and annotations required for Helm adoption;
-* image-pull secret availability in every dependent namespace;
-* certificate distribution and reload behavior;
-* KMS plugin checksum verification;
-* auto-unseal after startup;
-* DNS-based TLS addresses;
-* dedicated worker-pool scheduling;
-* the expected temporary snapshot-agent error before configuration completion; and
-* the configuration operator's minimum policy permissions.
-
-Certificate rotation used a sidecar to send a reload signal to OpenBao after certificate renewal. The certificate duration was made configurable, and the deployment used a dedicated internal CA distributed through the cluster trust mechanism.
-
-## 7. Results and current conclusions
-
-The implementation produced the following results:
-
-* OpenBao was selected after proof-of-concept evaluation rather than installed as an untested replacement.
-* Real applications consumed both static and generated secrets through the Kubernetes integration.
-* The Secret Definition model reduced direct human exposure to secret values.
-* The token/lease PoC identified a subtle production risk before broad adoption and led to a concrete caching and TTL decision.
-* Dynamic security testing did not confirm an exploitable critical finding under the default supported configuration.
-* The hardening work identified concrete deployment controls: dedicated nodes, TLS, disabled swap, restricted policies, KMS auto-unseal, disabled `sys/raw`, and controlled root-token use.
-* The deployment order and bootstrap limitations were documented, including the need to apply some policy changes manually to existing clusters.
-* Snapshot backup and restore became explicit production requirements rather than implicit assumptions.
-* Audit logging was treated as a reliability-sensitive dependency: if audit writes block or fail, OpenBao can stop serving requests.
-
-The result was not a claim that OpenBao is secure by default in every environment. The security outcome depends on the surrounding deployment, policy, identity, network, backup, and monitoring configuration.
-
-## 8. Production rollout approach
-
-The planning record described an initial release target in the second quarter of 2026, marked as tentative, with broader secret-management coverage expected later in 2026. The rollout was phased rather than treated as a single cutover.
-
-The production calendar should contain the following stages:
-
-1. development deployment and chart validation;
-2. representative staging deployment;
-3. pilot applications using static and generated secrets;
-4. security and production-readiness review;
-5. first production canary or production group;
-6. observation period with audit, latency, error, and application-health checks;
-7. additional production groups; and
-8. legacy-secret cleanup and final ownership review.
-
-Each stage should record:
-
-* responsible team;
-* change window;
-* approval requirements;
-* freeze-window checks;
-* success criteria;
-* rollback method;
-* evidence location; and
-* decision to proceed, pause, or revert.
-
-## 9. Upgrade and rollback experience
-
-OpenBao upgrades were not treated as true zero-downtime changes. With the documented procedure, expected downtime should be short, but it is still a change-window concern.
-
-The upgrade procedure has several important constraints:
-
-* review the release notes for all intervening versions;
-* take and verify a snapshot before the upgrade;
-* avoid failing over to an older leader;
-* update standby nodes before the leader;
-* use an `OnDelete` strategy or equivalent controlled rollout; and
-* use a post-upgrade job or runbook to automate the correct order.
-
-OpenBao does not guarantee that every storage-format change is backward-compatible. A rollback after a storage change may therefore require restoring the storage from a snapshot rather than deploying the previous image.
-
-## 10. Ongoing expectations
-
-The operating team is expected to:
-
-* review and apply OpenBao security updates through the vulnerability-management process;
-* update deployments at least quarterly or according to the approved maintenance policy;
-* keep image provenance and digests recorded;
-* maintain KMS, IAM, TLS, and certificate-rotation procedures;
-* maintain at least two tested audit and log-consumption paths where required by the security model;
-* monitor audit failures, request latency, authentication failures, seal state, Raft quorum, storage, and certificate expiry;
-* test backup restoration at least twice per year;
-* review configuration-operator policies with the security team;
-* rotate break-glass credentials when authorized personnel change;
-* review secret ownership and policy boundaries when workloads change; and
-* keep incident, upgrade, recovery, and secret-rotation runbooks current.
-
-## 11. Lessons learned
-
-### Treat secret management as a platform, not a package
-
-Installing the server is only one part of the work. Identity, policy, KMS, TLS, storage, backups, audit behavior, monitoring, and recovery must be designed together.
-
-### Test token lifetimes with real lease behavior
-
-Token TTLs and dynamic-secret TTLs are coupled. A configuration that looks correct from the token perspective can revoke application secrets earlier than intended.
-
-### Keep privileged functionality disabled
-
-Several apparent vulnerabilities required explicitly unsafe configuration or privileged permissions. The practical mitigation was not to grant those permissions and not to enable `sys/raw` during normal operation.
-
-### Make bootstrap behavior explicit
-
-The initialization job creates important resources only once. A later edit to a Kubernetes ConfigMap does not automatically change the policies already stored in OpenBao. Existing clusters require an explicit update procedure.
-
-### Design audit logging for failure behavior
-
-Audit logging is part of the request path. An audit destination that blocks can block OpenBao itself. Reliability, retention, and forensic requirements must be balanced when choosing audit devices.
-
-### Do not assume backup means recoverability
-
-A configured snapshot job is not proof of recovery. Restore into an isolated environment and verify that policies, authentication, secret data, and application access all recover correctly.
-
-## 12. Final assessment
-
-The migration experience supports OpenBao as a viable secrets-management platform when it is deployed and operated as a security-critical distributed service.
-
-The most important conclusion is that the migration was successful because it combined:
-
-* a clear reason to move away from encrypted-file secret handling;
-* a phased and compatible secret interface;
-* per-cluster isolation;
-* KMS-backed auto-unseal;
-* controlled bootstrap and least-privilege policies;
-* real-application validation;
-* token and lease testing;
-* targeted security testing;
-* documented backup and upgrade procedures; and
-* explicit operational ownership.
-
-OpenBao should not be presented as a drop-in replacement that eliminates operational responsibility. It provides the building blocks; the security and reliability outcome comes from the surrounding design and the discipline of operating it.
-
-## References
-
-* [OpenBao documentation](https://openbao.org/docs/)
-* [OpenBao source repository](https://github.com/openbao/openbao)
-* [OpenBao security model](https://openbao.org/docs/internals/security/)
-* [OpenBao integrated storage](https://openbao.org/docs/internals/integrated-storage/)
-* [OpenBao audit devices](https://openbao.org/docs/audit/)
-* [OpenBao seal concepts](https://openbao.org/docs/concepts/seal/)
-* [OpenBao token concepts](https://openbao.org/docs/concepts/tokens/)
-* [OpenBao production hardening guidance](https://openbao.org/docs/concepts/)
+### Rollout timing
+
+The review document had a tentative initial target in Q2 2026 and expected broader coverage later in 2026. It did not provide a verified, environment-by-environment production calendar. Confirm the actual rollout status and dates before treating those planning targets as current.
+
+## 8. Short glossary
+
+* **OpenBao:** open-source secrets-management service based on the Vault model.
+* **Vault:** HashiCorp's secrets-management product; its API and concepts are also used by OpenBao.
+* **Secret engine:** OpenBao component that stores or creates a type of secret.
+* **Lease:** OpenBao's record of how long a dynamic secret or token should remain valid.
+* **Policy:** Rules that say which identity can read, write, or manage a path.
+* **KMS:** Key Management Service; protects the key OpenBao uses to unlock its stored data.
+* **Raft:** A way for multiple OpenBao nodes to agree on stored data and elect an active node.
+* **CRD:** Kubernetes Custom Resource Definition; adds a new kind of object to the Kubernetes API.
+* **Configuration operator:** Kubernetes controller that applies configuration and synchronizes secrets.
+* **ESO:** External Secrets Operator; reads from an external secret store and creates Kubernetes Secrets.
+* **Auto-unseal:** OpenBao uses KMS to unlock itself after a restart, instead of a person entering key shares each time.
+
+## Sources
+
+This guide is a simplified, organization-neutral summary of internal architecture, deployment, security-review, pilot, token-lifecycle, and audit documentation. The three screenshots in `images/` are included as implementation examples; service-specific names in the token-flow screenshot were generalized.
