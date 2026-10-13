@@ -210,7 +210,3 @@ The review document had a tentative initial target in Q2 2026 and expected broad
 * **Configuration operator:** Kubernetes controller that applies configuration and synchronizes secrets.
 * **ESO:** External Secrets Operator; reads from an external secret store and creates Kubernetes Secrets.
 * **Auto-unseal:** OpenBao uses KMS to unlock itself after a restart, instead of a person entering key shares each time.
-
-## Sources
-
-This guide is a simplified, organization-neutral summary of internal architecture, deployment, security-review, pilot, token-lifecycle, and audit documentation. The three screenshots in `images/` are included as implementation examples; service-specific names in the token-flow screenshot were generalized.
