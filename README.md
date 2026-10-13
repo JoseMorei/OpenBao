@@ -5,9 +5,6 @@
 The project aimed to replace SOPS for Harness secrets. 230+ secrets were held in SOPS-encrypted files in GitHub, many employees could access the KMS key to decrypt them, and SOPS lacked enterprise-level access control and auditing.  
 The proposed OpenBao design lets teams define secrets in Kubernetes, have OpenBao generate or fetch them, and expose ordinary Kubernetes Secrets to applications—so apps don’t need to change how they consume secrets
 
-## About this guide
-
-It describes one real implementation, with company and service names generalized. The three diagrams are included as image files beside this document. One screenshot has been lightly edited to replace service-specific labels.
 
 ## 1. The problem this solves
 
